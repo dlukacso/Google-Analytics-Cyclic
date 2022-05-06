@@ -1,0 +1,374 @@
+---
+title: "Trip Analysis"
+author: "David Lukacsovich"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This is an R Markdown document, to perform data preparation and processing on to analyze the data for the Bike-Share case study from the [Google Analytics Capstone](https://www.coursera.org/learn/google-data-analytics-capstone) course. The original [data](https://divvy-tripdata.s3.amazonaws.com/index.html) is available online.
+
+# Get target data
+
+First, we need to get the data and modules that we will be working with
+
+## Load libraries
+
+```{r echo=FALSE}
+suppressMessages({
+  library(dplyr)
+  library(tidyr)
+  library(lubridate)
+  library(stringr)
+})
+```
+
+
+## Get a list of all target files
+
+Step 2 is to get the file names and locations of the raw data, and the locations that we will save them once we have cleaned them
+
+```{r}
+read_dir <- 'Read Data/Monthly'
+save_dir <- 'Read Data/Monthly_Cleaned'
+file_names <- list.files(path=read_dir, pattern='\\.csv$')
+read_names <- paste(read_dir, file_names, sep='/')
+save_names <- paste(save_dir, file_names, sep='/')
+```
+
+# Explore Data
+
+Next, we need to check for any errors in our data. Potential errors to check for are:
+
+* uniqueness - we need to make certain that there aren't any repeats. The **ride_id** columns should in theory take care of this, but it is simple to drop any repeats
+
+* realistic ride times - make certain that the ended_at data always comes after the started_at time.
+
+* valid memberships - we need to confirm that the **member_casual** column only contains two possible values: casual, and member
+
+* valid bike types - we need to confirm that the **rideable_type** column only contains valid categories of bikes: docked_bike, classic_bike, and electric_bike
+
+* valid stations - As our analysis will revolve around the start and end stations of rides, it is imperative that station names aren't missing, or aren't incorrect. We also need to check if the stations might not be indicative that someone other than a user used the bike to there.
+
+## Explore stations and conditionals
+
+First, we look at membership, bike types, and stations to look for any errors
+
+### Get all observed values
+We create 1 dataframe to store all member_causal and rideable_type pairs, and another dataframe to store all station names and station ids
+
+```{r}
+# initialize storage vectors
+df_types <- c()
+df_stations <- c()
+
+# iterate through read files
+for (read_name in read_names){
+  # read the file
+  df <- read.csv(read_name, colClasses='character')
+  df$started_at <- strptime(df$started_at, format="%Y-%m-%d %H:%M:%S")
+  df$ended_at <- strptime(df$ended_at, format="%Y-%m-%d %H:%M:%S")
+  
+  # drop duplicates and rides that lasted less than 0 minute
+  df <- df %>%
+    distinct() %>%
+    filter(ended_at - started_at > 0.)
+
+  # get membership type and bike type data
+  df_count <- df %>%
+    count(member_casual, rideable_type)
+  df_types <- rbind(df_types, df_count)
+  
+  # get station data
+  df_start <- df %>%
+    count(start_station_name, start_station_id) %>%
+    rename(station_name=start_station_name,
+           station_id=start_station_id)
+  df_end <- df %>%
+    count(end_station_name, end_station_id) %>%
+    rename(station_name=end_station_name,
+           station_id=end_station_id)
+  df_stations <- rbind(df_stations, df_start, df_end)
+}
+
+# merge results
+df_types <- df_types %>%
+  group_by(member_casual, rideable_type) %>%
+  summarize(count=sum(n))
+df_stations <- df_stations %>%
+  group_by(station_name, station_id) %>%
+  summarize(count=sum(n))
+```
+
+### Explore membership and bike types
+
+```{r}
+df_types
+```
+Printing the _df_types_ table, shows us that there were only 2 types of memberships - casual and member - and 3 bike types - classic, electric, and docked - with no typos. Therefore, there are no invalid values in those columns
+
+### Explore stations
+
+```{r}
+df_error <- df_stations %>%
+  filter(station_name == "" |
+           station_id == "" |
+           is.na(station_name) |
+           is.na(station_id))
+df_error$total_count <- sum(df_stations$count)
+df_error$total_percent <- round(df_error$count / df_error$total_count * 100,2)
+df_error
+```
+About 10.2% of all start or end points do not have a corresponding station, either name or station id. This is a sufficiently large number, that a follow up analysis could be done where, using the (Haversine Formula)<https://en.wikipedia.org/wiki/Haversine_formula>, we could label each start and end point by the nearest station, and the distance to that station using the longitude and latitude data. However, as we don't have the exact longitude and latitude of each station, this would require asking our stakeholders for extra information. Therefore, we instead drop this 9.57% of the data. The cases where only the station name or station id is missing make up less than 0.01% of the data, so we can safely drop those, instead of trying to fill out the matching parameter.
+
+We then look at all of the unique station names. Since there are many, we only look at those that don't have an **&** symbol in their name, which would indicate a street intersection
+
+```{r}
+df_stations <- df_stations %>%
+  filter(!(station_name == "" |
+           station_id == "" |
+           is.na(station_name) |
+           is.na(station_id)))
+  
+df_stations[grep('&', df_stations$station_name, invert=TRUE), ]
+```
+Going through the list, the following station names appear to be invalid locations:
+
+* Base - 2132 W Hubbard Warehouse
+* DIVVY CASSETTE REPAIR MOBILE STATION
+* HUBBARD ST BIKE CHECKING (LBS-WH-TEST)
+* Pawel Bialowas - Test- PBSC charging station; charging stations appear to be valid targets, but could have been taken there by the employees as well. As the validity of these data points are uncertain, they are still removed
+* Throop/Hastings Mobile Station
+* WATSON TESTING - DIVVY
+
+Therefore, these locations are removed, before continuing the analysis
+
+```{r}
+df_stations <- df_stations %>%
+  filter(!(station_name == "Base - 2132 W Hubbard Warehouse")) %>%
+  filter(!(station_name == "DIVVY CASSETTE REPAIR MOBILE STATION")) %>%
+  filter(!(station_name == "HUBBARD ST BIKE CHECKING (LBS-WH-TEST)")) %>%
+  filter(!(station_name == "Pawel Bialowas - Test- PBSC charging station")) %>%
+  filter(!(station_name == "Throop/Hastings Mobile Station")) %>%
+  filter(!(station_name == "WATSON TESTING - DIVVY"))
+```
+
+Lastly, we need to determine if we have a one-to-one mapping between station names and station ids
+
+```{r}
+df_name <- df_stations %>%
+  group_by(station_name) %>%
+  summarize(count=n()) %>%
+  group_by(count) %>%
+  summarize(station_name=n())
+df_id <- df_stations %>%
+  group_by(station_id) %>%
+  summarize(count=n()) %>%
+  group_by(count) %>%
+  summarize(station_id=n())
+```
+
+
+```{r}
+df_name
+```
+
+```{r}
+df_id
+```
+Based on these results, we can see that most station names correspond to multiple station ids, while only some station ids correspond to singular station names. Therefore, we need to directly look at the data, to see if we can "clean" it, and summarize it so that each station id corresponds to a single station name. First, we look at all station ids that correspond to 3 station names, and 2 station names separately.
+
+```{r}
+df_name <- df_stations %>%
+  group_by(station_name) %>%
+  summarize(count=n())
+df_id <- df_stations %>%
+  group_by(station_id) %>%
+  summarize(count=n())
+
+station_ids <- df_id[df_id$count==3,]$station_id
+station_names <- df_stations[df_stations$station_id %in% station_ids,
+                             ]$station_name
+
+df_stations %>%
+  filter(station_id %in% station_ids) %>%
+  arrange(station_id)
+```
+
+```{r}
+df_stations %>%
+  filter(station_name %in% station_names) %>%
+  arrange(station_name)
+```
+
+```{r}
+station_ids <- df_id[df_id$count==2,]$station_id
+
+df_stations %>%
+  filter(station_id %in% station_ids) %>%
+  arrange(station_id)
+```
+
+
+Exploring these data, we notice a few things:
+
+* We should remove _(Temp)_, _(Loomis)_, _(Halsted)_, _(*)_, 
+
+* Look into station names that contain _Vaccination Site_ in their names. We might be able to roll them up into a shared station id, so long as there aren't any overlaps. This can't be done with a simple deletion of the term though, as sometimes _St_ is removed from the station name when _Vaccination Site_ is added, so we have to write manual replaces for each case
+
+* Looking into the similar names, _Lake Shore Dr_ was renamed to _DuSable Lake Shore Dr_ [source](https://blockclubchicago.org/2021/10/21/lake-shore-drive-signs-now-have-its-new-name-dusable-lake-shore-drive-honoring-citys-black-founder/), so all cases of it need to be changed to unify the results. Doing a simple replace would be problematic, as that would change _DuSable Lake Shore Dr_ to _DuSable DuSable Lake Shore Dr_, so the simplest method would like be to first convert _DuSable Lake Shore Dr_ to _Lake Shore Dr_, and then convert it back.
+
+* Searching for _Argyle Ave_ doesn't return a search result, but _Argyle St_ does for divvy. Presumably this was also changed, and the name should be fixed in the table
+
+* All of these changes will still leave us with many distinct station names mapping to the same station id. And in some of those cases, those same station names then have multiple station ids. For example, _DuSable Lake Shore Dr & Ohio St_ has station ids _99_ and _TA1306000029_, while _TA1306000029_ also has a corresponding station name of _McClurg Ct & Ohio St_. It is possible that these are renamings that happened over time - for example, _99_ only corresponds to _Lake Shore Dr_, not _DuSable Lake Shore Dr_, but we would need to reach out to stakeholders for a table of all such cases to effectively clean the data at that point. Instead, it would be more practical to try 3 different analysis:
+
++ Group data by station names
+
++ Group data by station ids
+
++ Group data by unique pairs of station names and ids
+
+First, we look at all locations that have _Vaccination Site_ in the name
+
+```{r}
+ids <- df_stations[grep('Vaccination Site',
+                        df_stations$station_name),
+                   ]$station_id
+df_stations[df_stations$station_id %in% ids,]
+```
+
+The following conversions need to be made:
+
+* "Wilson - Truman College Vaccination Site" to "Wilsom Ave"
+
+* "63rd - Kennedy-King Vaccination Site" to "63rd St"
+
+* "Malcolm X College Vaccination Site" to "Malcolm X College"
+
+* "28th - Velasquez Institute Vaccination Site" to "28th St"
+
+Now that we have a list of what to alter, we make a list of what columns the cleaned data should have:
+
+* rideable_type - the column is kept as it
+
+* member_casual - the column is kept as it
+
+* started_at - the column is kept as is
+
+* ride_duration - the difference between ended_at and started_at. Measures the trip time in seconds
+
+* start_station_name - the column is kept as is
+
+* start_station_id - the column is kept as is
+
+* end_station_name - the column is kept as is
+
+* end_station_id - the column is kept as is
+
+# Clean Data
+
+Finally, we once more read in all of the data, rename stations as needed, re-organize into the columns that we want, and save the results into new files that can be used for analysis
+
+## Define Alterations
+
+We define the terms that should be removed, and the conversions to run
+
+```{r}
+to_remove <- c("(Temp)", "(Loomis)", "(Halsted)", "(*)")
+
+original <- c("DuSable Lake Shore Dr",
+              "Lake Shore Dr",
+              "Argyle Ave",
+              "Wilson - Truman College Vaccination Site",
+              "63rd - Kennedy-King Vaccination Site",
+              "Malcolm X College Vaccination Site",
+              "28th - Velasquez Institute Vaccination Site"
+              )
+converted <- c("Lake Shore Dr",
+               "DuSable Lake Shore Dr",
+               "Argyle St",
+               "Wilsom Ave",
+               "63rd St",
+               "Malcolm X College",
+               "28th St"
+               )
+to_convert <- data.frame(original, converted)
+```
+
+## Read and Write data
+
+Then, we iteratively read, clean, and save each data file
+
+```{r}
+for (file_ind in 1:length(read_names)){
+  # initialize variables
+  read_name <- read_names[file_ind]
+  save_name <- save_names[file_ind]
+  
+  # read the file
+  df <- read.csv(read_name, colClasses='character')
+  df$started_at <- strptime(df$started_at, format="%Y-%m-%d %H:%M:%S")
+  df$ended_at <- strptime(df$ended_at, format="%Y-%m-%d %H:%M:%S")
+  
+  # drop invalid stations
+  invalid_stations <- c("",
+                        "Base - 2132 W Hubbard Warehouse",
+                        "DIVVY CASSETTE REPAIR MOBILE STATION",
+                        "HUBBARD ST BIKE CHECKING (LBS-WH-TEST)",
+                        "Pawel Bialowas - Test- PBSC charging station",
+                        "Throop/Hastings Mobile Station",
+                        "WATSON TESTING - DIVVY"
+                        )
+  df <- df %>%
+    filter(!(start_station_id == "" |
+               end_station_id == "" |
+               is.na(start_station_name) |
+               is.na(end_station_name) |
+               is.na(start_station_id) |
+               is.na(end_station_id))) %>%
+    filter(!(start_station_name %in% invalid_stations)) %>%
+    filter(!(end_station_name %in% invalid_stations))
+  
+  # convert station names
+  for (replace_ind in 1:nrow(to_convert)) {
+    original <- to_convert[replace_ind, 'original']
+    convert <- to_convert[replace_ind, 'converted']
+    
+    df$start_station_name <- str_replace(df$start_station_name,
+                                         original, convert)
+    df$end_station_name <- str_replace(df$end_station_name,
+                                       original, convert)
+  }
+  
+  # drop extra labels
+  for (remove_item in to_remove){
+    df$start_station_name <- str_replace(df$start_station_name,
+                                         fixed(remove_item), "")
+    df$end_station_name <- str_replace(df$end_station_name,
+                                       fixed(remove_item), "")
+  }
+  df$start_station_name <- str_squish(str_trim(df$start_station_name))
+  df$end_station_name <- str_squish(str_trim(df$end_station_name))
+  
+  # drop duplicates and rides that lasted less than 0 minutes
+  df <- df %>%
+    distinct() %>%
+    filter(ended_at - started_at > 0.)
+  
+  # create the necessary new columns
+  df$ride_duration <- df$ended_at - df$started_at
+  
+  # reorder the columns, and restrict to columns of interest
+  columns <- c('rideable_type', 'member_casual', 'started_at',
+               'ride_duration', 'start_station_name', 'start_station_id',
+               'end_station_name', 'end_station_id')
+  df <- df[,columns]
+  
+  # save results
+  write.csv(df, file=save_name, quote=FALSE, row.names=FALSE)
+}
+```
+

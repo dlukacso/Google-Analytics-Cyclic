@@ -1,0 +1,545 @@
+---
+title: "Analyze Data"
+author: "David Lukacsovich"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Get Data
+
+First, we need to get the cleaned data, and modules that we will be working with
+
+## Load Libraries
+
+```{r}
+suppressMessages({
+  library(dplyr)
+  library(tidyr)
+  library(lubridate)
+  library(stringr)
+  library(ggplot2)
+})
+```
+
+## Read Data
+
+Next, we read in our data
+
+```{r}
+read_dir <- 'Read Data/Monthly_Cleaned'
+file_names <- list.files(path=read_dir, pattern='\\.csv$')
+read_names <- paste(read_dir, file_names, sep='/')
+
+colClasses <- c('factor', 'factor', 'character', 'numeric',
+                'character', 'character', 'character', 'character')
+df <- read.csv(read_names[1], colClasses=colClasses)
+
+for (read_name in read_names[2:length(read_names)]){
+  df <- rbind(df, read.csv(read_name, colClasses=colClasses))
+}
+```
+
+## Create Columns
+
+We create extra data columns with necessary values of interest. They are:
+
+* ride_month - the year and month of the ride
+
+* ride_date - the year, month, and day of the ride
+
+* ride_time - the hour, minute, and seconds of the ride
+
+* ride_day - the day of the week of the ride
+
+```{r}
+df$started_at <- strptime(df$started_at, format="%Y-%m-%d %H:%M:%S")
+df$ride_month <- format(df$started_at, '%Y-%m')
+df$ride_date <- format(df$started_at, '%Y-%m-%d')
+df$ride_time <- format(df$started_at, '%H:%M:%S')
+df$ride_day <- wday(df$started_at, label=TRUE)
+```
+
+# 2. Explore Ride Duration
+
+Next, we explore our data, to look for any patterns of differences between casual and member usage of bikes. We start with ride durations, to see if either user type takes longer or shorter rides on average.
+
+## Check extrema
+
+We start by creating a matrix where rides are binned by ride_duration. We only create a few bins, to see if the extrema between users are different.
+
+```{r}
+
+df_summary <- df %>%
+  group_by(member_casual) %>%
+  summarize(total_count = n())
+
+df_extreme <- df %>%
+  filter(ride_duration <= 60) %>%
+  group_by(member_casual) %>%
+  summarize(minute_count = n())
+
+df_summary <- merge(x=df_summary, y=df_extreme,
+                    by=c("member_casual"), all=TRUE)
+
+df_extreme <- df %>%
+  filter(ride_duration < (24 * 3600) & ride_duration >= (8*3600)) %>%
+  group_by(member_casual) %>%
+  summarize(long_count = n())
+
+df_summary <- merge(x=df_summary, y=df_extreme,
+                    by=c("member_casual"), all=TRUE)
+
+df_extreme <- df %>%
+  filter(ride_duration >= (24 * 3600)) %>%
+  group_by(member_casual) %>%
+  summarize(day_count = n())
+
+df_summary <- merge(x=df_summary, y=df_extreme,
+                    by=c("member_casual"), all=TRUE)
+  
+
+df_summary
+```
+
+We can quickly observe 3 things here:
+
+* There are about 30% more rides by members than by casuals
+
+* members are most likely to take rides that last a minute or less, though this still represents only ~1.5% of all rides by members
+
+* Casual users are more than 10 times as likely to take rides that last between 8 hours to a day, or longer than 24 hours. Still, even these inflated numbers represent only ~0.31% of all rides by casual users
+
+## Perform Overall Comparison
+
+We can see if the pattern is consistent across a wider range of bins, or if it changes over time, using a pair of heatmaps
+
+```{r}
+
+# summarize all rides into bins, and get counts by both ride time and
+# total duration
+breaks <- c(0, 60, 300, 600, 900, 1200,
+            1500, 1800, 2400, 3600, 2*3600,
+            4*3600, 24*3600,
+            max(df$ride_duration)+1)
+labels <- c('<1min', '1-5min', '5-10min', '10-15min', '15-20min',
+            '20-25min', '25-30min', '30-40min', '40min-1hr',
+            '1-2hr', '2-4hr', '4hr-1day', '>1day')
+
+df <- df %>%
+  mutate(duration_bin = cut(ride_duration, breaks=breaks, labels=labels,
+                            right=FALSE, 
+                            ))
+
+df_data <- df %>%
+  group_by(member_casual, ride_month, duration_bin) %>%
+  summarize(ride_count=n())
+
+df_total <- df_data %>%
+  group_by(member_casual, ride_month) %>%
+  summarize(total_count=sum(ride_count))
+
+df_data <- merge(x=df_data, y=df_total,
+                    by=c("member_casual", "ride_month"), all=TRUE)
+
+# convert data to percentages of total by month, then get difference by membership type
+df_data <- df_data %>%
+  mutate(percent_count=ride_count/total_count * 100)
+df_member <- df_data %>%
+  filter(member_casual=='member') %>%
+  mutate(member_count=percent_count
+         ) %>%
+  select(ride_month, duration_bin, member_count)
+df_casual <- df_data %>%
+  filter(member_casual=='casual') %>%
+  mutate(casual_count=percent_count
+         ) %>%
+  select(ride_month, duration_bin, casual_count)
+
+df_data <- merge(x=df_member, y=df_casual,
+                 by=c('ride_month', 'duration_bin'), all=TRUE) %>%
+  replace(is.na(.), 0)
+df_data$difference_count <- df_data$member_count - df_data$casual_count
+```
+
+
+```{r}
+hp_count <- ggplot(df_data, aes(duration_bin, ride_month,
+                                fill=difference_count)) +
+  geom_tile(color='black') +
+  scale_fill_gradient2(low="blue", mid='white', high="red",
+                       limit=c(-20,20),
+                       name='Difference (%)') +
+  labs(x='Ride duration', y='Ride month', title='Difference in the number of rides by duration') +
+  theme(axis.text.x = element_text(angle = 90))
+ggsave('Plots/Ride_Time.png', plot = hp_count)
+hp_count
+```
+
+We see a very strong pattern that is consistent over all months; casual users take longer rides than members. About two years ago, the cutoff was around the 20 minute mark; both members and casual users took ~20 minute long rides at the same rates. Since then, this has shrunk, and now the cutoff is around the 10 minute mark.
+
+# 3. Explore Bike Type
+
+Next we see if there is a difference in the type of bikes between members and casual users
+
+```{r}
+# Get counts by months for each bike type used for each user type
+df_data <- df %>%
+  group_by(member_casual, ride_month, rideable_type) %>%
+  summarize(ride_count=n())
+
+df_total <- df_data %>%
+  group_by(member_casual, ride_month) %>%
+  summarize(total_count=sum(ride_count))
+
+df_data <- merge(x=df_data, y=df_total,
+                    by=c("member_casual", "ride_month"), all=TRUE) %>%
+  mutate(percent_count = ride_count / total_count * 100)
+```
+
+
+```{r}
+bp_bike <- ggplot(data=df_data, aes(x=ride_month, y=percent_count, fill=member_casual)) +
+  geom_bar(stat='identity', position=position_dodge()) +
+  facet_wrap(~rideable_type, ncol=2) +
+  labs(x='Ride month', y='Fraction of rides (%)', title='Ride type comparison') +
+  theme(axis.text.x = element_text(angle = 90))
+ggsave('Plots/Bike_Type.png', plot=bp_bike)
+bp_bike
+```
+
+Here, we see that the classifications of electric bikes were introduced in August 2020, and classical bikes in November 2020. Both member and casual users used electric bikes at around the same rate from their time of introduction. However, while members completely stopped using docked bikes by 2021, casual users continued to use them at a low rate.
+
+Given the drastic and sudden drop, this could be representative of a significant difference between the two user groups, or it might be a technical artifact from how record keeping is handled.
+
+# 4. Temporal Differences
+
+Next, we need to see if there are any differences in the time of day, day of the week, or seasonal differences between casual users and members.
+
+## Time of Day
+
+First, we see if bike usage depends on time of day, and if so, whether there are any differences in when members and casual users prefer to ride their bikes.
+
+To do this, we make 2 plots. First, we do a heatmap of time of day versus month to see if there are any seasonal changes or patterns, and then we do a bar graph for the past last month, so that we can compare the two data side by side to see if there are any differences by user type.
+
+```{r}
+# we group data by month, hour, and user type
+df_data <- df %>%
+  mutate(ride_time = hour(hms(ride_time))) %>%
+  group_by(member_casual, ride_month, ride_time) %>%
+  summarize(ride_count=n())
+
+# next we get the total counts
+df_total <- df_data %>%
+  group_by(member_casual, ride_month) %>%
+  summarize(total_count=sum(ride_count))
+
+df_data <- merge(x=df_data, y=df_total,
+                    by=c("member_casual", "ride_month"), all=TRUE) %>%
+  mutate(percent_count = ride_count / total_count * 100)
+```
+
+```{r}
+hp_hour <- ggplot(df_data, aes(x=ride_month, y=ride_time, fill=percent_count)) +
+  geom_tile(color='black') +
+  scale_fill_gradient(low="white", high="red",
+                       limit=c(0,15),
+                       name='Fraction of rides (%)') +
+  labs(x='Ride month', y='Time of day (hours)',
+       title='Ride distribution by time of day') +
+  facet_wrap(~member_casual, ncol=1) +
+  theme(axis.text.x = element_text(angle = 90))
+ggsave('Plots/Monthly_Hour.png', plot=hp_hour)
+hp_hour
+```
+
+```{r}
+df_plot <- df_data %>%
+  filter(ride_month == '2022-04')
+bp_hour <- ggplot(df_plot, aes(x=ride_time, y=percent_count,
+                               fill=member_casual)) +
+  geom_bar(stat='identity', position=position_dodge()) +
+  labs(x='Time of day (hours)', y='Fraction of total rides (%)',
+       title='Ride distribution by time of day for April, 2022') +
+  theme(axis.text.x = element_text(angle = 90))
+ggsave('Plots/Hour_Dist.png', plot=bp_hour)
+bp_hour
+```
+
+While there appears to be a slight shift in the hour of day use over time, the fluctuation is small. It appears to be seasonal - in July of 2 years casual users ended up having peak activity a few hours later than in December - but does not seem useful for answering the key question. Similarly, while there is a difference in the hourly use habits of members and casual users - there is a spike in member usage between 7 and 9 am that isn't present for casual users - it doesn't correspond to a unique habit on the part of casual users that can be targeted. Perhaps an ad campaign to convince more people of the validity of biking to work may be applicable here, but otherwise this data isn't applicable to the key question.
+
+## Time of the Week
+
+Next, we plot usage by day of the week versus month. As we are also interested in seasonal changes, we do not take percentages, but use absolute counts this time.
+
+```{r}
+# get total ride counts by data and member type
+df_data <- df %>%
+  group_by(member_casual, ride_date) %>%
+  summarize(ride_count=n()) %>%
+  mutate(ride_date = strptime(ride_date, "%Y-%m-%d")) %>%
+  mutate(ride_month = format(ride_date, "%Y-%m"),
+         ride_day = wday(ride_date, label=TRUE)) %>%
+  group_by(member_casual, ride_month, ride_day) %>%
+  summarize(average_count=mean(ride_count))
+max(df_data$average_count)
+```
+```{r}
+hp_day <- ggplot(df_data, aes(x=ride_month, y=ride_day,
+                              fill=average_count)) +
+  geom_tile(color='black') +
+  scale_fill_gradient(low="cyan", high="red",
+                       limit=c(0,18000),
+                       name='Number of rides per day') +
+  labs(x='Ride month', y='Day of week',
+       title='Ride distribution by day of week') +
+  facet_wrap(~member_casual, ncol=1) +
+  theme(axis.text.x = element_text(angle = 90))
+ggsave('Plots/Monthly_Day.png', plot=hp_day)
+hp_day
+```
+
+Here, we note 2 more key factors:
+
+* There is a seasonal effect, where people - both members and casual users - will use the services more during the summer months. While this can't be used to target casual users, it can be kept in mind as the winters are lean months for Cyclic where advertising would have minimal effect.
+
+* Casual users are more likely to bike on the weekends, while members will bike more evenly across the entire week.
+
+The second is a fairly notable difference that could be targeted; either to try and convert casual users into daily users, or to highlight the convenience of weekend biking.
+
+# 5. Key Stations
+
+Finally, we can check if there are any start or end stations that are preferred by member or casual users. As we established in the Data Neither station name, nor station id appears to be a wholly unique identifier. Therefore, we will need to do the analysis by station name and station_id.
+
+## Compare by Station Name
+
+```{r}
+df_data <- df %>%
+  group_by(member_casual, ride_month, start_station_name) %>%
+  summarize(ride_count=n())
+
+df_total <- df_data %>%
+  group_by(member_casual, ride_month) %>%
+  summarize(total_count=sum(ride_count))
+
+df_data <- merge(x=df_data, y=df_total,
+                    by=c("member_casual", "ride_month"), all=TRUE) %>%
+  mutate(percent_count = ride_count / total_count * 100)
+
+# get difference in rate by month and station
+df_member <- df_data %>%
+  filter(member_casual=='member') %>%
+  mutate(member_count=percent_count
+         ) %>%
+  select(ride_month, start_station_name, member_count)
+df_casual <- df_data %>%
+  filter(member_casual=='casual') %>%
+  mutate(casual_count=percent_count
+         ) %>%
+  select(ride_month, start_station_name, casual_count)
+
+df_compare <- merge(x=df_member, y=df_casual,
+                 by=c('ride_month', 'start_station_name'), all=TRUE) %>%
+  replace(is.na(.), 0)
+df_compare$difference_count <- df_compare$member_count - df_compare$casual_count
+
+# find top 6 stations with biggest differences
+df_diff <- df_compare %>%
+  group_by(start_station_name) %>%
+  summarize(top_member=max(difference_count),
+            top_casual=min(difference_count)
+            )
+stations <- c(df_diff %>%
+                arrange(desc(top_member)) %>%
+                head(n=3) %>%
+                pull(start_station_name),
+              df_diff %>%
+                arrange(top_casual) %>%
+                head(n=3) %>%
+                pull(start_station_name)
+              )
+df_plot <- df_data %>%
+  filter(start_station_name %in% stations)
+```
+
+
+```{r}
+bp_station <- ggplot(data=df_plot, aes(x=ride_month, y=percent_count,
+                                       fill=member_casual)) +
+  geom_bar(stat='identity', position=position_dodge()) +
+  facet_wrap(~start_station_name, ncol=2) +
+  labs(x='Ride month', y='Fraction of rides (%)', title='Start station comparison') +
+  theme(axis.text.x = element_text(angle = 90))
+ggsave('Plots/Start_Station.png')
+bp_station
+```
+We have 3 stations - _DuSable Lake Shore Dr & Monroe St_, _Millennium Park_, and _Streeter Dr & Grand Ave_ which each, consistently make up at least 1% more of the casual user rides than the member user rides.
+
+## Compare by Station Id
+
+```{r}
+df_data <- df %>%
+  group_by(member_casual, ride_month, start_station_id) %>%
+  summarize(ride_count=n())
+
+df_total <- df_data %>%
+  group_by(member_casual, ride_month) %>%
+  summarize(total_count=sum(ride_count))
+
+df_data <- merge(x=df_data, y=df_total,
+                    by=c("member_casual", "ride_month"), all=TRUE) %>%
+  mutate(percent_count = ride_count / total_count * 100)
+
+# get difference in rate by month and station
+df_member <- df_data %>%
+  filter(member_casual=='member') %>%
+  mutate(member_count=percent_count
+         ) %>%
+  select(ride_month, start_station_id, member_count)
+df_casual <- df_data %>%
+  filter(member_casual=='casual') %>%
+  mutate(casual_count=percent_count
+         ) %>%
+  select(ride_month, start_station_id, casual_count)
+
+df_compare <- merge(x=df_member, y=df_casual,
+                 by=c('ride_month', 'start_station_id'), all=TRUE) %>%
+  replace(is.na(.), 0)
+df_compare$difference_count <- df_compare$member_count - df_compare$casual_count
+
+# find top 6 stations with biggest differences
+df_diff <- df_compare %>%
+  group_by(start_station_id) %>%
+  summarize(top_member=max(difference_count),
+            top_casual=min(difference_count)
+            )
+stations <- c(df_diff %>%
+                arrange(desc(top_member)) %>%
+                head(n=3) %>%
+                pull(start_station_id),
+              df_diff %>%
+                arrange(top_casual) %>%
+                head(n=3) %>%
+                pull(start_station_id)
+              )
+df_plot <- df_data %>%
+  filter(start_station_id %in% stations)
+```
+
+```{r}
+ggplot(data=df_plot, aes(x=ride_month, y=percent_count, fill=member_casual)) +
+  geom_bar(stat='identity', position=position_dodge()) +
+  facet_wrap(~start_station_id, ncol=2) +
+  labs(x='Ride month', y='Fraction of rides (%)', title='Start station comparison') +
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+Looking at the results for station_id, it appears to be a case where station ids were changed around November of 2020. ids _35_ and _13022_ line up with _Streeter Dr & Grand Ave_, while _13300_ lines up with _DuSable Lake Shore Dr & Monroe St_. Therefore, we can conclude that using station id instead of station name doesn't provide us with extra information in this case, and therefore we should stick to using station names for our analysis.
+
+## Compare End Stations
+
+We can run the analysis on end station names, to see if there are any patterns for where people finish their trips
+
+```{r}
+df_data <- df %>%
+  group_by(member_casual, ride_month, end_station_name) %>%
+  summarize(ride_count=n())
+
+df_total <- df_data %>%
+  group_by(member_casual, ride_month) %>%
+  summarize(total_count=sum(ride_count))
+
+df_data <- merge(x=df_data, y=df_total,
+                    by=c("member_casual", "ride_month"), all=TRUE) %>%
+  mutate(percent_count = ride_count / total_count * 100)
+
+# get difference in rate by month and station
+df_member <- df_data %>%
+  filter(member_casual=='member') %>%
+  mutate(member_count=percent_count
+         ) %>%
+  select(ride_month, end_station_name, member_count)
+df_casual <- df_data %>%
+  filter(member_casual=='casual') %>%
+  mutate(casual_count=percent_count
+         ) %>%
+  select(ride_month, end_station_name, casual_count)
+
+df_compare <- merge(x=df_member, y=df_casual,
+                 by=c('ride_month', 'end_station_name'), all=TRUE) %>%
+  replace(is.na(.), 0)
+df_compare$difference_count <- df_compare$member_count - df_compare$casual_count
+
+# find top 6 stations with biggest differences
+df_diff <- df_compare %>%
+  group_by(end_station_name) %>%
+  summarize(top_member=max(difference_count),
+            top_casual=min(difference_count)
+            )
+stations <- c(df_diff %>%
+                arrange(desc(top_member)) %>%
+                head(n=3) %>%
+                pull(end_station_name),
+              df_diff %>%
+                arrange(top_casual) %>%
+                head(n=3) %>%
+                pull(end_station_name)
+              )
+df_plot <- df_data %>%
+  filter(end_station_name %in% stations)
+```
+
+```{r}
+ggplot(data=df_plot, aes(x=ride_month, y=percent_count, fill=member_casual)) +
+  geom_bar(stat='identity', position=position_dodge()) +
+  facet_wrap(~end_station_name, ncol=2) +
+  labs(x='Ride month', y='Fraction of rides (%)', title='End station comparison') +
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+Here we notice that the top streets where casual users end their rides are the same as where they started their rides.
+
+## Top Station Ride Times
+
+To see if there is a connection, we look, for the top 3 stations where casual users are over represented, if there are any patterns in the start ride times for rides that start or end at those stations. To not over complicate the data with too many dimensions, and to use recent data, we restrict ourselves to data from the last 2 months.
+
+```{r}
+# first we get a vector of target stations
+stations <- df_diff %>%
+            arrange(top_casual) %>%
+            head(n=3) %>%
+            pull(end_station_name)
+
+# next, we get data for the last 2 months for those stations
+df_total <- df %>%
+  filter(ride_month %in% c('2022-03', '2022-04'),
+         (start_station_name %in% stations |
+            end_station_name %in% stations)
+         ) %>%
+  mutate(ride_time = hour(hms(ride_time))) %>%
+  select(member_casual, start_station_name, end_station_name,
+         ride_time)
+df_start <- df_total %>%
+  filter(start_station_name %in% stations) %>%
+  mutate(station=start_station_name, direction='start') %>%
+  select(member_casual, station, direction, ride_time)
+df_end <- df_total %>%
+  filter(end_station_name %in% stations) %>%
+  mutate(station=end_station_name, direction='end') %>%
+  select(member_casual, station, direction, ride_time)
+df_data <- rbind(df_start, df_end) %>%
+  group_by(member_casual, station, direction, ride_time) %>%
+  summarize(ride_count=n())
+```
+
+```{r}
+ggplot(data=df_data, aes(x=ride_time, y=ride_count, fill=direction)) +
+  geom_bar(stat='identity') +
+  facet_grid(member_casual~station) +
+  labs(x = "Time of day (hours)", y="Number of rides", title='Ride to station by time')
+```
+
+We can see here that the most frequent rides both to and from the stations occur at around the street times. Therefore, while we can note that usage at these stations is highest around 3pm, we can't use this data to derive any more interesting conclusions regarding trends of casual users, such as we might have had if, say, there was a high uptick of rides to the stations in the morning, and another uptick in rides away from the stations in the evening, indicating people using the bikes for work.
